@@ -5,10 +5,12 @@ WITH CTE_STRATEGIC_ACCOUNT_DUNS AS (
     SELECT
         DO.DUNS_NUMBER AS STRATEGIC_DUNS_NUMBER,
         DO.NAME AS STRATEGIC_ACCOUNT_NAME,
-        DO.MSA_ID,
+        DM.MSA_ID,
         DOC.CROSSWALKS_VALUE AS STRATEGIC_ACCOUNT_IDENTIFIER
     FROM
         STG_EDW.ODS.ODS_MDM_DUNSORG DO
+        INNER JOIN STG_EDW.ODS.ODS_MDM_DUNSORG_MSA DM
+            ON DO.URI = DM.URI
         INNER JOIN (
             SELECT
                 *,
@@ -27,6 +29,25 @@ WITH CTE_STRATEGIC_ACCOUNT_DUNS AS (
         AND DOC.SYS_DEL_IND = 'N'
 ),
 -- =====================================================================
+-- CTE: Base account dataset (single read from ODS_MDM_ACCOUNT)
+-- =====================================================================
+CTE_ACCOUNT_BASE AS (
+    SELECT
+        A.URI,
+        A.SRC_LAST_UPDATE_DTM,
+        A.STRATEGIC_ACCOUNT_ID,
+        A.PARENT_DUNS,
+        A.HEADQUARTERS_DUNS,
+        A.DOMESTIC_ULTIMATE_DUNS,
+        A.GLOBAL_ULTIMATE_DUNS,
+        A.CDH_CUSTOMER_ID
+    FROM
+        STG_EDW.ODS.ODS_MDM_ACCOUNT A
+    WHERE
+        A.STRATEGIC_ACCOUNT_ID IS NULL
+        --AND A.SRC_LAST_UPDATE_DTM >= $$LastRun_Time
+),
+-- =====================================================================
 -- CTE: Match account to strategic account through hierarchy DUNS fields
 -- =====================================================================
 CTE_ACCOUNT_DUNS_MATCH AS (
@@ -37,18 +58,15 @@ CTE_ACCOUNT_DUNS_MATCH AS (
         1 AS DUNS_MATCH_FLG,
         0 AS MSA_MATCH_FLG
     FROM
-        STG_EDW.ODS.ODS_MDM_ACCOUNT A
+        CTE_ACCOUNT_BASE A
         INNER JOIN CTE_STRATEGIC_ACCOUNT_DUNS SD
             ON A.PARENT_DUNS = SD.STRATEGIC_DUNS_NUMBER
             OR A.HEADQUARTERS_DUNS = SD.STRATEGIC_DUNS_NUMBER
             OR A.DOMESTIC_ULTIMATE_DUNS = SD.STRATEGIC_DUNS_NUMBER
             OR A.GLOBAL_ULTIMATE_DUNS = SD.STRATEGIC_DUNS_NUMBER
-    WHERE
-        A.STRATEGIC_ACCOUNT_ID IS NULL
-        --AND A.SRC_LAST_UPDATE_DTM >= $$LastRun_Time
 ),
 -- =====================================================================
--- CTE: Match account to strategic account through MSA_ID
+-- CTE: Match account to strategic account through CDH_CUSTOMER_ID
 -- =====================================================================
 CTE_ACCOUNT_MSA_MATCH AS (
     SELECT DISTINCT
@@ -58,12 +76,9 @@ CTE_ACCOUNT_MSA_MATCH AS (
         0 AS DUNS_MATCH_FLG,
         1 AS MSA_MATCH_FLG
     FROM
-        STG_EDW.ODS.ODS_MDM_ACCOUNT A
+        CTE_ACCOUNT_BASE A
         INNER JOIN CTE_STRATEGIC_ACCOUNT_DUNS SD
-            ON A.MSA_ID = SD.MSA_ID
-    WHERE
-        A.STRATEGIC_ACCOUNT_ID IS NULL
-        --AND A.SRC_LAST_UPDATE_DTM >= $$LastRun_Time
+            ON A.CDH_CUSTOMER_ID = SD.MSA_ID
 ),
 -- =====================================================================
 -- CTE: Consolidate DUNS and MSA matches per account and strategic account
@@ -102,13 +117,13 @@ CTE_REL_ACCT_WITHOUT_STRATEGIC AS (
             'StrategicAccount' AS Relationship_Source,
             '' AS Relationship_Source_Table,
             CASE
-                WHEN CM.DUNS_MATCH_FLG = 1 AND CM.MSA_MATCH_FLG = 1
-                THEN 'DUNS Match and MSA Match'
-                WHEN CM.DUNS_MATCH_FLG = 1 AND CM.MSA_MATCH_FLG = 0
-                THEN 'DUNS Match but No MSA Match'
-                WHEN CM.DUNS_MATCH_FLG = 0 AND CM.MSA_MATCH_FLG = 1
-                THEN 'No DUNS Match but MSA Match'
+                WHEN CM.DUNS_MATCH_FLG = 1 THEN 'DUNS Match'
+                ELSE 'NO DUNS Match'
             END AS Relationship_Type,
+            CASE
+                WHEN CM.MSA_MATCH_FLG = 1 THEN 'Yes'
+                ELSE 'No'
+            END AS MSA_Account,
             TO_VARCHAR(CM.SRC_LAST_UPDATE_DTM, 'YYYY-MM-DD HH24:MI:SS.FF3') AS Audit_Updatetime,
             TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS Relationship_Created_Datetime,
             TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"') AS Relationship_Last_Updated_Datetime,
@@ -128,14 +143,11 @@ CTE_REL_ACCT_WITHOUT_STRATEGIC AS (
                     END
             ) AS rn
         FROM
-            STG_EDW.ODS.ODS_MDM_ACCOUNT A
+            CTE_ACCOUNT_BASE A
             INNER JOIN CTE_ACCOUNT_MATCH_CONSOLIDATED CM
                 ON A.URI = CM.URI
             INNER JOIN STG_EDW.ODS.ODS_MDM_ACCOUNT_CROSSWALKS AC
                 ON A.URI = AC.URI
-        WHERE
-            A.STRATEGIC_ACCOUNT_ID IS NULL
-            --AND A.SRC_LAST_UPDATE_DTM >= $$LastRun_Time
     ) sub
     WHERE rn = 1
 )
@@ -154,6 +166,7 @@ SELECT
     R.Relationship_Source,
     R.Relationship_Source_Table,
     R.Relationship_Type,
+    R.MSA_Account,
     R.Audit_Updatetime,
     R.Relationship_Created_Datetime,
     R.Relationship_Last_Updated_Datetime,
